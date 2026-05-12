@@ -1,0 +1,48 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.manifold import TSNE
+from matplotlib.font_manager import FontProperties
+import matplotlib as mpl
+
+font_chinese = FontProperties(fname='C:/Windows/Fonts/simsun.ttc')
+font_english = FontProperties(fname='C:/Windows/Fonts/times.ttf')
+plt.rcParams['font.family'] = 'SimSun'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['axes.unicode_minus'] = False
+
+df = pd.read_excel(r"YOUR PATH")
+X = df[['ar_ash', 'ar_volatile_matter', 'ar_moisture', 'ar_fixed_carbon', 'ar_S', 'ar_carbon', 'ar_hydrogen', 'ar_oxygen','ar_nitrogen']]
+y = df['ar_Q']
+labels = df['lable']  
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+tsne = TSNE(n_components=2, perplexity=30, learning_rate=200, n_iter=1000, random_state=42, init='pca', n_jobs=-1)
+X_tsne = tsne.fit_transform(X_scaled)
+
+fig, axs = plt.subplots(2, 2, figsize=(9, 8),dpi=300)
+axs = axs.flatten()  
+categories = ['SW', 'biomass', 'coal', 'Standard Coal']
+
+category_colors = {'SW': 'red',  'biomass': 'blue',  'coal': 'purple',  'Standard Coal': 'green'  }
+grey_rgba = mpl.colors.to_rgba('#D3D3D3', alpha=0.7)
+
+for i, category in enumerate(categories):
+    rgba_array = np.tile(grey_rgba, (len(labels), 1)) 
+    mask = (labels == category)
+    category_color = category_colors[category]
+
+    if np.any(mask):  
+        current_color_rgba = mpl.colors.to_rgba(category_color, alpha=0.8)
+        rgba_array[mask] = current_color_rgba 
+
+    axs[i].scatter(X_tsne[:, 0], X_tsne[:, 1],c=rgba_array,s=10,edgecolors='w',linewidth=0.5)
+    axs[i].set_xticks([])
+    axs[i].set_yticks([])
+    axs[i].grid(False)
+
+plt.show()
+
