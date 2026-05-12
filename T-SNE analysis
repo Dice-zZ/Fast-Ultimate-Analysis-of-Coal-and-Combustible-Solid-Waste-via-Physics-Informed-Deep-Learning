@@ -1,0 +1,41 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.manifold import TSNE
+from matplotlib.font_manager import FontProperties
+
+# fonts setting
+font_chinese = FontProperties(fname='C:/Windows/Fonts/simsun.ttc')  
+font_english = FontProperties(fname='C:/Windows/Fonts/times.ttf')  
+plt.rcParams['font.family'] = 'SimSun'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['axes.unicode_minus'] = False
+
+df = pd.read_excel(your data path)
+
+X = df[['ar_ash', 'ar_volatile_matter', 'ar_moisture','ar_fixed_carbon', 'ar_S', 'ar_carbon','ar_hydrogen', 'ar_oxygen', 'ar_nitrogen']]
+y = df['ar_Q']  
+
+# data standardization
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# t-SNE
+tsne = TSNE(n_components=2, perplexity=40, learning_rate=200, n_iter=1000, random_state=42,init='pca', n_jobs=-1)
+X_tsne = tsne.fit_transform(X_scaled)
+plt.figure(figsize = (10, 8),dpi = 300)
+scatter = plt.scatter(X_tsne[:, 0], X_tsne[:, 1], c=y, cmap='RdYlBu_r', s=40, alpha=0.95, edgecolors='w')
+
+cbar = plt.colorbar(scatter, ticks=[5000,10000,15000,20000,25000,30000,35000])
+cbar.set_label('Qar(kJ/kg)', fontsize=20, fontproperties=font_english)  # use ontproperties
+plt.title('Q value', fontproperties=font_chinese, fontsize=20)
+
+ax = plt.gca()
+ax.tick_params(axis='both', which='both', length=0)
+ax.set_xticks([]) 
+ax.set_yticks([])
+
+plt.grid(False)
+plt.tight_layout()
+plt.show()
