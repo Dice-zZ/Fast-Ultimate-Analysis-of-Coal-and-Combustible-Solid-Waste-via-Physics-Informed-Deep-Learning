@@ -1,0 +1,373 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from bayes_opt import BayesianOptimization
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+import os
+import joblib
+from torch.utils.data import DataLoader, TensorDataset
+from matplotlib.font_manager import FontProperties
+from scipy.stats import spearmanr
+
+font_chinese = FontProperties(fname='C:/Windows/Fonts/simsun.ttc')
+font_english = FontProperties(fname='C:/Windows/Fonts/times.ttf')
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman']
+plt.rcParams['axes.unicode_minus'] = False
+
+def read_excel_data(file_path):
+    df = pd.read_excel(file_path)
+    return df
+
+def preprocess_data(x_train, x_test, y_train, y_test):
+    scaler_x = StandardScaler()
+    x_train_scaled = scaler_x.fit_transform(x_train).astype(np.float32)
+    x_test_scaled = scaler_x.transform(x_test).astype(np.float32)
+
+    scaler_y = StandardScaler()
+    y_train_scaled = scaler_y.fit_transform(y_train).astype(np.float32)
+    y_test_scaled = scaler_y.transform(y_test).astype(np.float32)
+
+    return x_train_scaled, x_test_scaled, y_train_scaled, y_test_scaled, scaler_x, scaler_y
+
+class CustomLoss(nn.Module):
+    def __init__(self, y_train_inv_mean, y_train_inv_std):
+        super().__init__()
+        self.register_buffer('y_train_inv_mean', torch.tensor(y_train_inv_mean, dtype=torch.float32))
+        self.register_buffer('y_train_inv_std', torch.tensor(y_train_inv_std, dtype=torch.float32))
+
+    def forward(self, y_pred, y_true, ar_ash, ar_moisture, ar_S):
+        device = y_true.device
+        y_train_inv_mean = self.y_train_inv_mean.to(device)
+        y_train_inv_std = self.y_train_inv_std.to(device)
+
+        y_true_inv = y_true * y_train_inv_std + y_train_inv_mean
+        y_pred_inv = y_pred * y_train_inv_std + y_train_inv_mean
+
+        mse_loss = torch.mean((y_true_inv - y_pred_inv) ** 2)
+        pred_sum = torch.sum(y_pred_inv, dim=1)
+        total_sum = ar_ash.to(device) + ar_moisture.to(device) + ar_S.to(device) + pred_sum
+        phy_loss = torch.mean(((total_sum - 100.0) ** 2))
+        return [mse_loss, phy_loss]
+
+class GradNorm(nn.Module):
+    def __init__(self, num_tasks, alpha=1.5):
+        super().__init__()
+        self.num_tasks = num_tasks
+        self.alpha = alpha
+        self.weights = nn.Parameter(torch.ones(num_tasks))
+        self.initial_losses = None
+
+    def forward(self, losses, model):
+        if self.initial_losses is None:
+            self.initial_losses = [l.detach() for l in losses]
+        with torch.no_grad():
+            loss_ratios = torch.stack([loss.detach() / self.initial_losses[i]
+                                       for i, loss in enumerate(losses)])
+            inverse_train_rates = loss_ratios / torch.mean(loss_ratios)
+
+        grad_norms = []
+        for i, loss in enumerate(losses):
+            model.zero_grad()
+            loss.backward(retain_graph=True)
+            grad_norm = torch.norm(self.weights[i] * torch.stack([torch.norm(p.grad)
+                                                                  for p in model.parameters() if p.grad is not None]), p=2)
+            grad_norms.append(grad_norm)
+            model.zero_grad()
+        grad_norms = torch.stack(grad_norms)
+        avg_grad_norm = torch.mean(grad_norms.detach())
+        target_grads = avg_grad_norm * (inverse_train_rates ** self.alpha)
+        target_grads = target_grads.detach()
+        grad_loss = torch.mean(torch.abs(grad_norms - target_grads))
+        return grad_loss
+
+class RegressionModel(nn.Module):
+    def __init__(self, input_size, hidden_size1, hidden_size2, dropout1, dropout2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size1), nn.ReLU(), nn.Dropout(dropout1),
+            nn.Linear(hidden_size1, hidden_size2), nn.ReLU(), nn.Dropout(dropout2),
+            nn.Linear(hidden_size2, 4)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+def train_model(model, x_train, y_train, y_train_inv_mean, y_train_inv_std,
+                ar_ash, ar_moisture, ar_S, batch_size, epochs, device):
+    x_tensor = torch.tensor(x_train).to(device)
+    y_tensor = torch.tensor(y_train).to(device)
+    ar_ash_tensor = torch.tensor(ar_ash).to(device)
+    ar_moisture_tensor = torch.tensor(ar_moisture).to(device)
+    ar_S_tensor = torch.tensor(ar_S).to(device)
+    dataset = TensorDataset(x_tensor, y_tensor, ar_ash_tensor, ar_moisture_tensor, ar_S_tensor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    grad_norm = GradNorm(num_tasks=2, alpha=1.0).to(device)
+    grad_optimizer = optim.Adam(grad_norm.parameters(), lr=0.001)
+    criterion = CustomLoss(y_train_inv_mean, y_train_inv_std).to(device)
+    optimizer = optim.Adam(model.parameters())
+
+    model.train()
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for X_batch, y_batch, ash_batch, moist_batch, S_batch in dataloader:
+            optimizer.zero_grad()
+            grad_optimizer.zero_grad()
+
+            outputs = model(X_batch)
+            losses = criterion(outputs, y_batch, ash_batch, moist_batch, S_batch)
+            
+            grad_loss = grad_norm(losses, model)
+            grad_loss.backward()
+            grad_optimizer.step()
+
+            weighted_loss = sum([w * loss for w, loss in zip(grad_norm.weights, losses)])
+            weighted_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            epoch_loss += weighted_loss.item() * X_batch.size(0)
+
+        epoch_loss /= len(dataloader.dataset)
+        weights = grad_norm.weights.detach().cpu().numpy()
+        if (epoch + 1) % 50 == 0:
+            print(f"Epoch {epoch + 1}/{epochs} - Loss: {epoch_loss:.4f} "
+                  f"Weights: MSE={weights[0]:.3f}, Phy={weights[1]:.3f}")
+
+def test_model(model, x_test, y_test, scaler_y, device):
+    model.eval()
+    with torch.no_grad():
+        x_tensor = torch.tensor(x_test).to(device)
+        y_pred = model(x_tensor).cpu().numpy()
+
+    y_pred_inv = scaler_y.inverse_transform(y_pred)
+    y_test_inv = scaler_y.inverse_transform(y_test)
+    
+    r2 = r2_score(y_test_inv, y_pred_inv, multioutput='raw_values')
+    mse = mean_squared_error(y_test_inv, y_pred_inv, multioutput='raw_values')
+    
+    spearman_corrs = []
+    for i in range(y_test_inv.shape[1]):
+        corr, _ = spearmanr(y_test_inv[:, i], y_pred_inv[:, i])
+        spearman_corrs.append(corr)
+    
+    return r2, mse, np.array(spearman_corrs), y_pred_inv
+
+def save_model_and_scalers(model, scaler_X, scaler_y, model_path="gp.pt", scaler_dir="scalers"):
+    if not os.path.exists(scaler_dir):
+        os.makedirs(scaler_dir)
+    torch.save({'model_state_dict': model.state_dict(),
+                'input_size': model.net[0].in_features}, model_path)
+    joblib.dump(scaler_X, os.path.join(scaler_dir, "spx.pkl"))
+    joblib.dump(scaler_y, os.path.join(scaler_dir, "spy.pkl"))
+    print(f"Model and scaler were saved to {model_path} 和 {scaler_dir}")
+
+def save_predictions_to_excel(y_true, y_pred, features, output_path, sheet_name="Predictions"):
+    df = pd.DataFrame({
+        'True_Carbon': y_true[:, 0], 'Pred_Carbon': y_pred[:, 0],
+        'True_Hydrogen': y_true[:, 1], 'Pred_Hydrogen': y_pred[:, 1],
+        'True_Oxygen': y_true[:, 2], 'Pred_Oxygen': y_pred[:, 2],
+        'True_Nitrogen': y_true[:, 3], 'Pred_Nitrogen': y_pred[:, 3],
+        'ar_ash': features[:, 0], 'ar_volatile_matter': features[:, 1],
+        'ar_Q': features[:, 2], 'ar_moisture': features[:, 3],
+        'ar_fixed_carbon': features[:, 4], 'ar_S': features[:, 5]
+    })
+    df.to_excel(output_path, index=False, sheet_name=sheet_name)
+    print(f"Result Save To: {output_path}")
+
+def plot_comparison(y_true_train, y_pred_train, y_true_test, y_pred_test,
+                    title, r2_train, r2_test, mse_train, mse_test, spearman_train, spearman_test):
+    fig, axs = plt.subplots(2, 2, figsize=(10, 10))
+    axs = axs.flatten()
+    for i in range(4):
+        min_val = min(np.min(y_true_train[:, i]), np.min(y_true_test[:, i]))
+        max_val = max(np.max(y_true_train[:, i]), np.max(y_true_test[:, i]))
+        axs[i].scatter(y_true_train[:, i], y_pred_train[:, i], label='Train', c='orange')
+        axs[i].scatter(y_true_test[:, i], y_pred_test[:, i], label='Test', c='blue', alpha=0.5)
+        axs[i].plot([min_val * 0.9, max_val * 1.1], [min_val * 0.9, max_val * 1.1],
+                    color='r', linestyle='--', label='y=x')
+        axs[i].set_xlabel('True Value', fontproperties=font_chinese)
+        axs[i].set_ylabel('Predicting Value', fontproperties=font_chinese)
+        axs[i].set_title(f'True VS Predicting- {title[i]}', fontproperties=font_chinese)
+        axs[i].set_xlim(min_val * 0.9, max_val * 1.1)
+        axs[i].set_ylim(min_val * 0.9, max_val * 1.1)
+
+        text_content = (f'R2-Train: {r2_train[i]:.3f}\nR2-Test: {r2_test[i]:.3f}\n'
+                        f'MSE-Train: {mse_train[i]:.4f}\nMSE-Test: {mse_test[i]:.4f}\n'
+                        f'Spearman-Train: {spearman_train[i]:.3f}\nSpearman-Test: {spearman_test[i]:.3f}')
+        axs[i].text(0.1, 0.5, text_content,
+                    fontsize=9, transform=axs[i].transAxes,
+                    bbox=dict(facecolor='white', alpha=0.8))
+        axs[i].legend()
+    plt.tight_layout()
+    plt.show()
+
+def bayesian_optimization(X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled,
+                          y_train_inv_mean, y_train_inv_std, ar_ash, ar_moisture, ar_S,
+                          input_size, device, **params):
+    hidden_size1 = int(params['hidden_size1'])
+    hidden_size2 = int(params['hidden_size2'])
+    dropout1 = params['dropout1']
+    dropout2 = params['dropout2']
+    learning_rate = 10 ** params['log_lr']
+    batch_size = int(2 ** params['log2_bs'])
+
+    model = RegressionModel(
+        input_size=input_size,
+        hidden_size1=int(params['hidden_size1']),
+        hidden_size2=int(params['hidden_size2']),
+        dropout1=params['dropout1'],
+        dropout2=params['dropout2']
+    ).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    x_tensor = torch.tensor(X_train_scaled).to(device)
+    y_tensor = torch.tensor(y_train_scaled).to(device)
+    ar_ash_tensor = torch.tensor(ar_ash).to(device)
+    ar_moisture_tensor = torch.tensor(ar_moisture).to(device)
+    ar_S_tensor = torch.tensor(ar_S).to(device)
+
+    dataset = TensorDataset(x_tensor, y_tensor, ar_ash_tensor, ar_moisture_tensor, ar_S_tensor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    criterion = CustomLoss(y_train_inv_mean, y_train_inv_std).to(device)
+
+    model.train()
+    for epoch in range(30):
+        for X_batch, y_batch, ash_batch, moist_batch, S_batch in dataloader:
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            losses = criterion(outputs, y_batch, ash_batch, moist_batch, S_batch)
+            total_loss = sum(losses)
+            total_loss.backward()
+            optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        x_val_tensor = torch.tensor(X_val_scaled).to(device)
+        y_pred = model(x_val_tensor).cpu().numpy()
+    r2 = r2_score(y_val_scaled, y_pred)
+    return r2
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using Device: {device}")
+    
+    file_path = "your path"
+    df = read_excel_data(file_path)
+    df = df.iloc[:1603]
+
+    x = df[['ar_ash', 'ar_volatile_matter', 'ar_Q', 'ar_moisture', 'ar_fixed_carbon', 'ar_S']].values.astype(np.float32)
+    y = df[['ar_carbon', 'ar_hydrogen', 'ar_oxygen', 'ar_nitrogen']].values.astype(np.float32)
+    x_train_val, x_test, y_train_val, y_test = train_test_split(x, y, test_size=0.2, random_state=42, shuffle=True)
+    x_train, x_val, y_train, y_val = train_test_split( x_train_val, y_train_val, test_size=0.2, random_state=42, shuffle=True)
+    
+    print(f"训练集大小: {x_train.shape[0]}")
+    print(f"验证集大小: {x_val.shape[0]}")
+    print(f"测试集大小: {x_test.shape[0]}")
+
+    X_train_scaled, X_test_scaled, y_train_scaled, y_test_scaled, scaler_X, scaler_y = preprocess_data(x_train, x_test, y_train, y_test)
+
+    X_val_scaled = scaler_X.transform(x_val).astype(np.float32)
+    y_val_scaled = scaler_y.transform(y_val).astype(np.float32)
+    y_train_inv_mean = y_train.mean(axis=0)
+    y_train_inv_std = y_train.std(axis=0)
+    
+    ar_ash_train = x_train[:, 0]  # ar_ash
+    ar_moisture_train = x_train[:, 3]  # ar_moisture
+    ar_S_train = x_train[:, 5]  # ar_S
+    
+    pbounds = {'hidden_size1': (16, 256),'hidden_size2': (16, 256),
+        'dropout1': (0.1, 0.5),'dropout2': (0.1, 0.5),
+        'log_lr': (-6, -2),'log2_bs': (4, 8)}
+    
+    optimizer = BayesianOptimization(
+        f=lambda **params: bayesian_optimization(
+            X_train_scaled, y_train_scaled, X_val_scaled, y_val_scaled,
+            y_train_inv_mean, y_train_inv_std,
+            ar_ash_train, ar_moisture_train, ar_S_train,
+            X_train_scaled.shape[1],
+            device, **params),
+        pbounds=pbounds,
+        verbose=2,
+        random_state=42
+    )
+
+    optimizer.maximize(init_points=5, n_iter=75)
+    best_params = optimizer.max['params']
+    print("\nThe Best Params:")
+    for key, value in best_params.items():
+        print(f"{key}: {value}")
+    
+    best_hidden_size1 = int(best_params['hidden_size1'])
+    best_hidden_size2 = int(best_params['hidden_size2'])
+    best_dropout1 = best_params['dropout1']
+    best_dropout2 = best_params['dropout2']
+    best_lr = 10 ** best_params['log_lr']
+    best_batch_size = int(2 ** best_params['log2_bs'])
+
+    X_full_train = np.vstack([X_train_scaled, X_val_scaled])
+    y_full_train = np.vstack([y_train_scaled, y_val_scaled])
+    ar_ash_full = np.concatenate([ar_ash_train, x_val[:, 0]])
+    ar_moisture_full = np.concatenate([ar_moisture_train, x_val[:, 3]])
+    ar_S_full = np.concatenate([ar_S_train, x_val[:, 5]])
+
+    print("\nUsing The Best Params...")
+    model = RegressionModel(
+        input_size=X_train_scaled.shape[1],
+        hidden_size1=best_hidden_size1,hidden_size2=best_hidden_size2,
+        dropout1=best_dropout1,dropout2=best_dropout2).to(device)
+    
+    train_model(model, X_full_train, y_full_train, y_train_inv_mean, y_train_inv_std,
+                ar_ash_full, ar_moisture_full, ar_S_full, best_batch_size, 600, device)
+
+    r2_train_scores, mse_train_scores, spearman_train, y_train_pred = test_model(model, X_full_train, y_full_train, scaler_y, device)
+    r2_test_scores, mse_test_scores, spearman_test, y_test_pred = test_model( model, X_test_scaled, y_test_scaled, scaler_y, device)
+    save_model_and_scalers(model, scaler_X, scaler_y,
+                           model_path=r"your path",
+                           scaler_dir=r"your path")
+
+    print("\nTrain dataset R2:", r2_train_scores)
+    print("Testing dataset R2:", r2_test_scores)
+    print("Train dataset MSE:", mse_train_scores)
+    print("Testing dataset MSE:", mse_test_scores)
+    print("Train datasetSpearman ρ:", spearman_train)
+    print("Testing dataset Spearman ρ:", spearman_test)
+    
+    plot_comparison(
+        scaler_y.inverse_transform(y_full_train), y_train_pred,
+        scaler_y.inverse_transform(y_test_scaled), y_test_pred,
+        ['C', 'H', 'O', 'N'],
+        r2_train_scores, r2_test_scores,mse_train_scores, mse_test_scores,spearman_train, spearman_test
+    )
+    
+
+    train_output_path = r"YOUR PATH"
+    test_output_path = r"YOUR PATH"
+    
+    y_full_train_inv = scaler_y.inverse_transform(y_full_train)
+    y_test_inv = scaler_y.inverse_transform(y_test_scaled)
+    
+    save_predictions_to_excel(
+        y_true=y_full_train_inv, y_pred=y_train_pred,
+        features=scaler_X.inverse_transform(X_full_train), 
+        output_path=train_output_path,
+        sheet_name="Train dataset Result"
+    )
+    
+    save_predictions_to_excel(
+        y_true=y_test_inv, y_pred=y_test_pred,
+        features=scaler_X.inverse_transform(X_test_scaled), 
+        output_path=test_output_path,
+        sheet_name="Test dataset Result"
+    )
+
+if __name__ == "__main__":
+    main()
